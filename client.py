@@ -33,46 +33,61 @@ class ScreenCaptureThread(QThread):
         super().__init__()
         self.socket = socket
         self.running = True
-        self.sct = mss()
+        self.sct = None  # 将在run方法中初始化
         self.last_send_time = 0
         self.frame_interval = 1/30  # 30 FPS
 
     def run(self):
-        while self.running:
-            try:
-                current_time = time.time()
-                if current_time - self.last_send_time >= self.frame_interval:
-                    # 捕获屏幕
-                    screenshot = self.sct.grab(self.sct.monitors[1])  # 主显示器
+        try:
+            # 在线程中初始化mss
+            self.sct = mss()
+            logger.info("屏幕捕获线程启动")
+            
+            while self.running:
+                try:
+                    current_time = time.time()
+                    if current_time - self.last_send_time >= self.frame_interval:
+                        # 捕获屏幕
+                        monitor = self.sct.monitors[1]  # 主显示器
+                        screenshot = self.sct.grab(monitor)
+                        
+                        # 转换为PIL Image
+                        img = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+                        
+                        # 压缩图像
+                        img = img.resize((800, 600), Image.Resampling.LANCZOS)
+                        
+                        # 转换为QImage
+                        qimg = QImage(img.tobytes(), img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
+                        
+                        # 发送帧
+                        self.frame_ready.emit(qimg)
+                        
+                        # 发送到服务器
+                        self.send_frame(img)
+                        
+                        self.last_send_time = current_time
                     
-                    # 转换为PIL Image
-                    img = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+                    time.sleep(0.001)  # 防止CPU过载
                     
-                    # 压缩图像
-                    img = img.resize((800, 600), Image.Resampling.LANCZOS)
+                except Exception as e:
+                    logger.error(f"屏幕捕获循环错误: {str(e)}")
+                    time.sleep(1)  # 发生错误时等待一秒再继续
+                    continue
                     
-                    # 转换为QImage
-                    qimg = QImage(img.tobytes(), img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
-                    
-                    # 发送帧
-                    self.frame_ready.emit(qimg)
-                    
-                    # 发送到服务器
-                    self.send_frame(img)
-                    
-                    self.last_send_time = current_time
-                
-                time.sleep(0.001)  # 防止CPU过载
-                
-            except Exception as e:
-                logger.error(f"屏幕捕获错误: {str(e)}")
-                self.error_signal.emit(f"屏幕捕获错误: {str(e)}")
-                break
+        except Exception as e:
+            error_msg = f"屏幕捕获线程错误: {str(e)}"
+            logger.error(error_msg)
+            self.error_signal.emit(error_msg)
+        finally:
+            self.stop()
 
     def send_frame(self, img):
         try:
             # 将图像转换为字节
             img_bytes = img.tobytes()
+            # 发送帧类型标识
+            self.socket.send(b'F')
             # 发送图像大小
             self.socket.send(len(img_bytes).to_bytes(4, 'big'))
             # 发送图像数据
@@ -83,6 +98,9 @@ class ScreenCaptureThread(QThread):
 
     def stop(self):
         self.running = False
+        if self.sct:
+            self.sct.close()
+        logger.info("屏幕捕获线程已停止")
 
 class ClientThread(QThread):
     status_signal = pyqtSignal(str)
@@ -189,6 +207,9 @@ class ClientThread(QThread):
     def send_command(self, command):
         try:
             if self.socket:
+                # 发送命令类型标识
+                self.socket.send(b'C')
+                # 发送命令数据
                 self.socket.send(json.dumps(command).encode('utf-8'))
         except Exception as e:
             error_msg = f"发送命令错误: {str(e)}"
