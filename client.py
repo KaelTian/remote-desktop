@@ -106,6 +106,7 @@ class ClientThread(QThread):
     status_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
     frame_ready = pyqtSignal(QPixmap)
+    connection_lost = pyqtSignal()  # 添加连接丢失信号
 
     def __init__(self, host, port):
         super().__init__()
@@ -116,45 +117,85 @@ class ClientThread(QThread):
         self.mouse_listener = None
         self.keyboard_listener = None
         self.screen_capture = None
+        self.connected = False
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 3
+        self.reconnect_delay = 2  # 重连延迟（秒）
 
     def run(self):
+        while self.running:
+            try:
+                if not self.connected:
+                    self.connect_to_server()
+                
+                if self.connected:
+                    # 保持连接活跃
+                    self.socket.send(b'P')  # 发送心跳包
+                    time.sleep(1)
+                
+            except Exception as e:
+                error_msg = f"连接错误: {str(e)}"
+                logger.error(error_msg)
+                self.handle_connection_error()
+                time.sleep(self.reconnect_delay)
+
+    def connect_to_server(self):
         try:
             logger.info(f"正在连接到服务器 {self.host}:{self.port}")
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(5)  # 设置连接超时
             self.socket.connect((self.host, self.port))
+            self.socket.settimeout(None)  # 取消超时设置
+            
+            self.connected = True
+            self.reconnect_attempts = 0
             self.status_signal.emit("已连接到服务器")
             logger.info("成功连接到服务器")
 
             # 设置鼠标监听器
-            self.mouse_listener = mouse.Listener(
-                on_click=self.on_click,
-                on_move=self.on_move)
-            self.mouse_listener.start()
-            logger.info("鼠标监听器已启动")
+            if not self.mouse_listener or not self.mouse_listener.is_alive():
+                self.mouse_listener = mouse.Listener(
+                    on_click=self.on_click,
+                    on_move=self.on_move)
+                self.mouse_listener.start()
+                logger.info("鼠标监听器已启动")
 
             # 设置键盘监听器
-            self.keyboard_listener = keyboard.Listener(
-                on_press=self.on_press,
-                on_release=self.on_release)
-            self.keyboard_listener.start()
-            logger.info("键盘监听器已启动")
+            if not self.keyboard_listener or not self.keyboard_listener.is_alive():
+                self.keyboard_listener = keyboard.Listener(
+                    on_press=self.on_press,
+                    on_release=self.on_release)
+                self.keyboard_listener.start()
+                logger.info("键盘监听器已启动")
 
             # 启动屏幕捕获
-            self.screen_capture = ScreenCaptureThread(self.socket)
-            self.screen_capture.frame_ready.connect(self.handle_frame)
-            self.screen_capture.error_signal.connect(self.error_signal)
-            self.screen_capture.start()
-            logger.info("屏幕捕获已启动")
-
-            while self.running:
-                pass
+            if not self.screen_capture or not self.screen_capture.isRunning():
+                self.screen_capture = ScreenCaptureThread(self.socket)
+                self.screen_capture.frame_ready.connect(self.handle_frame)
+                self.screen_capture.error_signal.connect(self.handle_screen_capture_error)
+                self.screen_capture.start()
+                logger.info("屏幕捕获已启动")
 
         except Exception as e:
-            error_msg = f"连接错误: {str(e)}"
-            logger.error(error_msg)
-            self.error_signal.emit(error_msg)
-        finally:
+            self.handle_connection_error()
+            raise
+
+    def handle_connection_error(self):
+        self.connected = False
+        self.reconnect_attempts += 1
+        
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            self.status_signal.emit("连接失败，已达到最大重试次数")
+            self.connection_lost.emit()
             self.stop()
+            return
+            
+        self.status_signal.emit(f"连接断开，正在尝试重连 ({self.reconnect_attempts}/{self.max_reconnect_attempts})")
+        logger.warning(f"连接断开，尝试重连 ({self.reconnect_attempts}/{self.max_reconnect_attempts})")
+
+    def handle_screen_capture_error(self, error_msg):
+        logger.error(f"屏幕捕获错误: {error_msg}")
+        self.handle_connection_error()
 
     def handle_frame(self, qimg):
         # 更新预览窗口
@@ -205,6 +246,10 @@ class ClientThread(QThread):
             pass
 
     def send_command(self, command):
+        if not self.connected:
+            logger.warning("未连接到服务器，无法发送命令")
+            return
+            
         try:
             if self.socket:
                 # 发送命令类型标识
@@ -214,10 +259,12 @@ class ClientThread(QThread):
         except Exception as e:
             error_msg = f"发送命令错误: {str(e)}"
             logger.error(error_msg)
-            self.error_signal.emit(error_msg)
+            self.handle_connection_error()
 
     def stop(self):
         self.running = False
+        self.connected = False
+        
         if self.mouse_listener:
             self.mouse_listener.stop()
         if self.keyboard_listener:
@@ -225,7 +272,10 @@ class ClientThread(QThread):
         if self.screen_capture:
             self.screen_capture.stop()
         if self.socket:
-            self.socket.close()
+            try:
+                self.socket.close()
+            except:
+                pass
         logger.info("客户端已停止")
 
 class ClientWindow(QMainWindow):
@@ -265,7 +315,7 @@ class ClientWindow(QMainWindow):
         
         # 本地预览
         local_preview = QVBoxLayout()
-        local_label = QLabel("本地预览")
+        local_label = QLabel("本地预览 (控制端)")
         local_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         local_preview.addWidget(local_label)
         
@@ -275,11 +325,17 @@ class ClientWindow(QMainWindow):
         self.local_screen.setStyleSheet("border: 1px solid black;")
         local_preview.addWidget(self.local_screen)
         
+        # 添加本地预览说明
+        local_info = QLabel("显示当前控制端的屏幕内容")
+        local_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        local_info.setStyleSheet("color: gray;")
+        local_preview.addWidget(local_info)
+        
         preview_layout.addLayout(local_preview)
         
         # 远程预览
         remote_preview = QVBoxLayout()
-        remote_label = QLabel("远程预览")
+        remote_label = QLabel("远程预览 (被控制端)")
         remote_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         remote_preview.addWidget(remote_label)
         
@@ -289,11 +345,24 @@ class ClientWindow(QMainWindow):
         self.remote_screen.setStyleSheet("border: 1px solid black;")
         remote_preview.addWidget(self.remote_screen)
         
+        # 添加远程预览说明
+        remote_info = QLabel("显示被控制端的屏幕内容")
+        remote_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        remote_info.setStyleSheet("color: gray;")
+        remote_preview.addWidget(remote_info)
+        
         preview_layout.addLayout(remote_preview)
         
         layout.addLayout(preview_layout)
         
+        # 添加操作说明
+        instruction_label = QLabel("使用说明：\n1. 输入服务器IP地址并连接\n2. 连接成功后，可以在本地预览中看到控制端的屏幕\n3. 在远程预览中可以看到被控制端的屏幕\n4. 使用鼠标和键盘控制被控制端")
+        instruction_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        instruction_label.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        layout.addWidget(instruction_label)
+        
         self.client_thread = None
+        self.local_capture = None
         logger.info("客户端界面初始化完成")
 
     def toggle_connection(self):
@@ -304,16 +373,49 @@ class ClientWindow(QMainWindow):
             self.client_thread.status_signal.connect(self.update_status)
             self.client_thread.error_signal.connect(self.show_error)
             self.client_thread.frame_ready.connect(self.update_remote_screen)
+            self.client_thread.connection_lost.connect(self.handle_connection_lost)
             self.client_thread.start()
+            
+            # 启动本地预览
+            self.start_local_preview()
+            
             self.connect_button.setText("断开连接")
             logger.info(f"正在连接到服务器: {host}")
         else:
             # 断开连接
             self.client_thread.stop()
             self.client_thread = None
+            self.stop_local_preview()
             self.connect_button.setText("连接到服务器")
             self.status_label.setText("未连接")
             logger.info("已断开与服务器的连接")
+
+    def start_local_preview(self):
+        if not self.local_capture:
+            self.local_capture = ScreenCaptureThread(None)  # 不发送到服务器
+            self.local_capture.frame_ready.connect(self.update_local_screen)
+            self.local_capture.start()
+            logger.info("本地预览已启动")
+
+    def stop_local_preview(self):
+        if self.local_capture:
+            self.local_capture.stop()
+            self.local_capture = None
+            logger.info("本地预览已停止")
+
+    def update_local_screen(self, qimg):
+        pixmap = QPixmap.fromImage(qimg)
+        self.local_screen.setPixmap(pixmap)
+
+    def update_remote_screen(self, pixmap):
+        self.remote_screen.setPixmap(pixmap)
+
+    def handle_connection_lost(self):
+        self.connect_button.setText("连接到服务器")
+        self.status_label.setText("连接已断开")
+        self.client_thread = None
+        self.stop_local_preview()
+        logger.info("连接已断开")
 
     def update_status(self, message):
         self.status_label.setText(message)
@@ -323,12 +425,10 @@ class ClientWindow(QMainWindow):
         QMessageBox.critical(self, "错误", message)
         logger.error(f"错误: {message}")
 
-    def update_remote_screen(self, pixmap):
-        self.remote_screen.setPixmap(pixmap)
-
     def closeEvent(self, event):
         if self.client_thread:
             self.client_thread.stop()
+        self.stop_local_preview()
         logger.info("应用程序关闭")
         event.accept()
 
