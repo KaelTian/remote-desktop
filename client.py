@@ -87,6 +87,7 @@ class ScreenCaptureThread(QThread):
 class ClientThread(QThread):
     status_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
+    frame_ready = pyqtSignal(QPixmap)
 
     def __init__(self, host, port):
         super().__init__()
