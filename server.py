@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 class ServerThread(QThread):
     status_signal = pyqtSignal(str)
     frame_ready = pyqtSignal(QImage)
-    client_connected = pyqtSignal(str)  # 新增客户端连接信号
-    client_disconnected = pyqtSignal()  # 新增客户端断开信号
+    client_connected = pyqtSignal(str)
+    client_disconnected = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -33,8 +33,9 @@ class ServerThread(QThread):
         self.client_socket = None
         self.client_address = None
         self.last_heartbeat = 0
-        self.heartbeat_timeout = 5  # 心跳超时时间（秒）
+        self.heartbeat_timeout = 5
         self.heartbeat_check_timer = None
+        self.buffer = bytearray()  # 添加缓冲区
 
     def run(self):
         try:
@@ -49,26 +50,24 @@ class ServerThread(QThread):
                 try:
                     if not self.client_socket:
                         self.client_socket, self.client_address = self.server_socket.accept()
-                        self.client_socket.settimeout(1)  # 设置接收超时
+                        self.client_socket.settimeout(1)
                         self.last_heartbeat = time.time()
                         self.client_connected.emit(f"{self.client_address[0]}:{self.client_address[1]}")
                         logger.info(f"客户端已连接: {self.client_address}")
                         self.start_heartbeat_check()
+                        self.buffer.clear()  # 清空缓冲区
 
-                    # 接收命令类型
+                    # 接收数据
                     try:
-                        command_type = self.client_socket.recv(1)
-                        if not command_type:
+                        data = self.client_socket.recv(4096)
+                        if not data:
                             raise ConnectionError("连接已断开")
 
-                        if command_type == b'C':  # Command
-                            self.handle_command()
-                        elif command_type == b'F':  # Frame
-                            self.handle_frame()
-                        elif command_type == b'P':  # Heartbeat
-                            self.handle_heartbeat()
+                        self.buffer.extend(data)
+                        self.process_buffer()
+
                     except socket.timeout:
-                        continue  # 超时继续循环
+                        continue
                     except Exception as e:
                         raise
 
@@ -76,7 +75,7 @@ class ServerThread(QThread):
                     error_msg = f"客户端连接错误: {str(e)}"
                     logger.error(error_msg)
                     self.handle_client_error()
-                    time.sleep(1)  # 等待一秒后继续监听
+                    time.sleep(1)
 
         except Exception as e:
             error_msg = f"服务器错误: {str(e)}"
@@ -85,61 +84,93 @@ class ServerThread(QThread):
         finally:
             self.stop()
 
-    def handle_command(self):
-        try:
-            # 接收命令数据
-            data = self.client_socket.recv(1024).decode('utf-8')
-            if not data:
-                raise ConnectionError("连接已断开")
+    def process_buffer(self):
+        while len(self.buffer) > 0:
+            try:
+                # 获取命令类型
+                command_type = self.buffer[0]
+                self.buffer = self.buffer[1:]
 
-            command = json.loads(data)
-            self.execute_command(command)
+                if command_type == ord('C'):  # Command
+                    self.process_command()
+                elif command_type == ord('F'):  # Frame
+                    self.process_frame()
+                elif command_type == ord('P'):  # Heartbeat
+                    self.handle_heartbeat()
+                else:
+                    logger.warning(f"未知的命令类型: {command_type}")
+                    self.buffer.clear()  # 清空缓冲区
+                    break
+
+            except Exception as e:
+                logger.error(f"处理缓冲区数据错误: {str(e)}")
+                self.buffer.clear()
+                break
+
+    def process_command(self):
+        try:
+            # 查找JSON数据的结束位置
+            try:
+                data_str = self.buffer.decode('utf-8')
+                json_end = data_str.find('}') + 1
+                if json_end <= 0:
+                    return  # 数据不完整，等待更多数据
+
+                # 提取并解析JSON数据
+                json_data = data_str[:json_end]
+                command = json.loads(json_data)
+                
+                # 移除已处理的数据
+                self.buffer = self.buffer[json_end:]
+                
+                # 执行命令
+                self.execute_command(command)
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析错误: {str(e)}")
+                self.buffer.clear()
+                raise
+            except UnicodeDecodeError as e:
+                logger.error(f"UTF-8解码错误: {str(e)}")
+                self.buffer.clear()
+                raise
+
         except Exception as e:
             logger.error(f"处理命令错误: {str(e)}")
             raise
 
-    def handle_frame(self):
+    def process_frame(self):
         try:
-            # 接收帧大小
-            size_bytes = self.client_socket.recv(4)
-            if not size_bytes:
-                raise ConnectionError("连接已断开")
-            frame_size = int.from_bytes(size_bytes, 'big')
+            if len(self.buffer) < 4:
+                return  # 数据不完整，等待更多数据
 
-            # 接收帧数据
-            frame_data = b''
-            while len(frame_data) < frame_size:
-                chunk = self.client_socket.recv(min(frame_size - len(frame_data), 4096))
-                if not chunk:
-                    raise ConnectionError("连接已断开")
-                frame_data += chunk
+            # 获取帧大小
+            frame_size = int.from_bytes(self.buffer[:4], 'big')
+            self.buffer = self.buffer[4:]
 
-            if len(frame_data) == frame_size:
-                # 创建QImage
-                qimg = QImage(frame_data, 800, 600, 800 * 3, QImage.Format.Format_RGB888)
-                self.frame_ready.emit(qimg)
+            # 检查是否有足够的数据
+            if len(self.buffer) < frame_size:
+                return  # 数据不完整，等待更多数据
+
+            # 提取帧数据
+            frame_data = self.buffer[:frame_size]
+            self.buffer = self.buffer[frame_size:]
+
+            # 创建QImage
+            qimg = QImage(frame_data, 800, 600, 800 * 3, QImage.Format.Format_RGB888)
+            self.frame_ready.emit(qimg)
+
         except Exception as e:
             logger.error(f"处理帧错误: {str(e)}")
+            self.buffer.clear()
             raise
 
     def handle_heartbeat(self):
         self.last_heartbeat = time.time()
         try:
-            self.client_socket.send(b'P')  # 回复心跳
+            self.client_socket.send(b'P')
         except:
             pass
-
-    def start_heartbeat_check(self):
-        if self.heartbeat_check_timer:
-            self.heartbeat_check_timer.stop()
-        self.heartbeat_check_timer = QTimer()
-        self.heartbeat_check_timer.timeout.connect(self.check_heartbeat)
-        self.heartbeat_check_timer.start(1000)  # 每秒检查一次
-
-    def check_heartbeat(self):
-        if self.client_socket and time.time() - self.last_heartbeat > self.heartbeat_timeout:
-            logger.warning("心跳超时，客户端可能已断开")
-            self.handle_client_error()
 
     def handle_client_error(self):
         if self.client_socket:
@@ -151,6 +182,7 @@ class ServerThread(QThread):
             self.client_address = None
             self.client_disconnected.emit()
             self.status_signal.emit("客户端断开连接")
+            self.buffer.clear()  # 清空缓冲区
             logger.info("客户端断开连接")
 
     def execute_command(self, command):
@@ -186,7 +218,20 @@ class ServerThread(QThread):
                 self.server_socket.close()
             except:
                 pass
+        self.buffer.clear()  # 清空缓冲区
         logger.info("服务器已停止")
+
+    def start_heartbeat_check(self):
+        if self.heartbeat_check_timer:
+            self.heartbeat_check_timer.stop()
+        self.heartbeat_check_timer = QTimer()
+        self.heartbeat_check_timer.timeout.connect(self.check_heartbeat)
+        self.heartbeat_check_timer.start(1000)  # 每秒检查一次
+
+    def check_heartbeat(self):
+        if self.client_socket and time.time() - self.last_heartbeat > self.heartbeat_timeout:
+            logger.warning("心跳超时，客户端可能已断开")
+            self.handle_client_error()
 
 class ServerWindow(QMainWindow):
     def __init__(self):
