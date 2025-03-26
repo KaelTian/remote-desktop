@@ -36,6 +36,7 @@ class ScreenCaptureThread(QThread):
         self.sct = None  # 将在run方法中初始化
         self.last_send_time = 0
         self.frame_interval = 1/30  # 30 FPS
+        self.sleep_time = 0.01  # 添加睡眠时间，减少CPU使用
 
     def run(self):
         try:
@@ -64,11 +65,13 @@ class ScreenCaptureThread(QThread):
                         self.frame_ready.emit(qimg)
                         
                         # 发送到服务器
-                        self.send_frame(img)
+                        if self.socket:  # 只在有socket连接时发送
+                            self.send_frame(img)
                         
                         self.last_send_time = current_time
                     
-                    time.sleep(0.001)  # 防止CPU过载
+                    # 添加睡眠时间，减少CPU使用
+                    time.sleep(self.sleep_time)
                     
                 except Exception as e:
                     logger.error(f"屏幕捕获循环错误: {str(e)}")
@@ -388,6 +391,7 @@ class ClientWindow(QMainWindow):
             self.stop_local_preview()
             self.connect_button.setText("连接到服务器")
             self.status_label.setText("未连接")
+            self.remote_screen.clear()  # 清空远程预览
             logger.info("已断开与服务器的连接")
 
     def start_local_preview(self):
@@ -408,7 +412,12 @@ class ClientWindow(QMainWindow):
         self.local_screen.setPixmap(pixmap)
 
     def update_remote_screen(self, pixmap):
-        self.remote_screen.setPixmap(pixmap)
+        # 更新远程预览窗口
+        self.remote_screen.setPixmap(pixmap.scaled(
+            self.remote_screen.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ))
 
     def handle_connection_lost(self):
         self.connect_button.setText("连接到服务器")

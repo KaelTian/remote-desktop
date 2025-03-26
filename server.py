@@ -36,6 +36,9 @@ class ServerThread(QThread):
         self.heartbeat_timeout = 5
         self.heartbeat_check_timer = None
         self.buffer = bytearray()  # 添加缓冲区
+        self.frame_interval = 1/30  # 30 FPS
+        self.last_frame_time = 0
+        self.sleep_time = 0.01  # 添加睡眠时间，减少CPU使用
 
     def run(self):
         try:
@@ -67,6 +70,8 @@ class ServerThread(QThread):
                         self.process_buffer()
 
                     except socket.timeout:
+                        # 添加睡眠时间，减少CPU使用
+                        time.sleep(self.sleep_time)
                         continue
                     except Exception as e:
                         raise
@@ -141,6 +146,10 @@ class ServerThread(QThread):
 
     def process_frame(self):
         try:
+            current_time = time.time()
+            if current_time - self.last_frame_time < self.frame_interval:
+                return  # 控制帧率
+
             if len(self.buffer) < 4:
                 return  # 数据不完整，等待更多数据
 
@@ -159,6 +168,7 @@ class ServerThread(QThread):
             # 创建QImage
             qimg = QImage(frame_data, 800, 600, 800 * 3, QImage.Format.Format_RGB888)
             self.frame_ready.emit(qimg)
+            self.last_frame_time = current_time
 
         except Exception as e:
             logger.error(f"处理帧错误: {str(e)}")
