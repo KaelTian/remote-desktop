@@ -36,7 +36,7 @@ class ScreenCaptureThread(QThread):
         self.sct = None  # 将在run方法中初始化
         self.last_send_time = 0
         self.frame_interval = 1/30  # 30 FPS
-        self.sleep_time = 0.01  # 添加睡眠时间，减少CPU使用
+        self.is_local_preview = socket is None  # 是否是本地预览模式
 
     def run(self):
         try:
@@ -61,11 +61,11 @@ class ScreenCaptureThread(QThread):
                         # 转换为QImage
                         qimg = QImage(img.tobytes(), img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
                         
-                        # 发送帧
+                        # 发送帧到预览窗口
                         self.frame_ready.emit(qimg)
                         
-                        # 发送到服务器
-                        if self.socket:  # 只在有socket连接时发送
+                        # 如果不是本地预览模式，则发送到服务器
+                        if not self.is_local_preview:
                             self.send_frame(img)
                         
                         self.last_send_time = current_time
@@ -396,7 +396,8 @@ class ClientWindow(QMainWindow):
 
     def start_local_preview(self):
         if not self.local_capture:
-            self.local_capture = ScreenCaptureThread(None)  # 不发送到服务器
+            # 创建一个新的 ScreenCaptureThread 实例，但不会发送到服务器
+            self.local_capture = ScreenCaptureThread(None)
             self.local_capture.frame_ready.connect(self.update_local_screen)
             self.local_capture.start()
             logger.info("本地预览已启动")
@@ -408,16 +409,13 @@ class ClientWindow(QMainWindow):
             logger.info("本地预览已停止")
 
     def update_local_screen(self, qimg):
+        # 更新本地预览窗口，显示控制端(服务器端)的屏幕内容
         pixmap = QPixmap.fromImage(qimg)
         self.local_screen.setPixmap(pixmap)
 
     def update_remote_screen(self, pixmap):
-        # 更新远程预览窗口
-        self.remote_screen.setPixmap(pixmap.scaled(
-            self.remote_screen.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ))
+        # 更新远程预览窗口，显示被控端(客户端)的屏幕内容
+        self.remote_screen.setPixmap(pixmap)
 
     def handle_connection_lost(self):
         self.connect_button.setText("连接到服务器")

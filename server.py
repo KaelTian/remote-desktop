@@ -52,13 +52,18 @@ class ServerThread(QThread):
             while self.running:
                 try:
                     if not self.client_socket:
-                        self.client_socket, self.client_address = self.server_socket.accept()
-                        self.client_socket.settimeout(1)
-                        self.last_heartbeat = time.time()
-                        self.client_connected.emit(f"{self.client_address[0]}:{self.client_address[1]}")
-                        logger.info(f"客户端已连接: {self.client_address}")
-                        self.start_heartbeat_check()
-                        self.buffer.clear()  # 清空缓冲区
+                        self.server_socket.settimeout(0.1)  # 设置较短的超时时间
+                        try:
+                            self.client_socket, self.client_address = self.server_socket.accept()
+                            self.client_socket.settimeout(0.1)  # 设置较短的超时时间
+                            self.last_heartbeat = time.time()
+                            self.client_connected.emit(f"{self.client_address[0]}:{self.client_address[1]}")
+                            logger.info(f"客户端已连接: {self.client_address}")
+                            self.start_heartbeat_check()
+                            self.buffer.clear()  # 清空缓冲区
+                        except socket.timeout:
+                            time.sleep(0.01)  # 添加短暂延迟
+                            continue
 
                     # 接收数据
                     try:
@@ -70,8 +75,7 @@ class ServerThread(QThread):
                         self.process_buffer()
 
                     except socket.timeout:
-                        # 添加睡眠时间，减少CPU使用
-                        time.sleep(self.sleep_time)
+                        time.sleep(0.01)  # 添加短暂延迟
                         continue
                     except Exception as e:
                         raise
@@ -80,7 +84,7 @@ class ServerThread(QThread):
                     error_msg = f"客户端连接错误: {str(e)}"
                     logger.error(error_msg)
                     self.handle_client_error()
-                    time.sleep(1)
+                    time.sleep(0.1)  # 错误后等待较长时间
 
         except Exception as e:
             error_msg = f"服务器错误: {str(e)}"
@@ -111,6 +115,8 @@ class ServerThread(QThread):
                 logger.error(f"处理缓冲区数据错误: {str(e)}")
                 self.buffer.clear()
                 break
+
+            time.sleep(0.001)  # 添加短暂延迟，避免CPU占用过高
 
     def process_command(self):
         try:
